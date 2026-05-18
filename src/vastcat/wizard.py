@@ -20,10 +20,17 @@ from .theme import CAT_ASCII, cat_say
 
 
 ATTACK_MODES = {
-    "Straight (mode 0)": "0",
-    "Combinator (mode 1)": "1",
-    "Mask / Brute-force (mode 3)": "3",
-    "Hybrid Wordlist + Mask (mode 6)": "6",
+    "Straight (mode 0) — wordlist + rules": "0",
+    "Combinator (mode 1) — two wordlists combined": "1",
+    "Mask / Brute-force (mode 3) — pattern only": "3",
+    "Hybrid Wordlist + Mask (mode 6) — wordlist prepended to mask": "6",
+}
+
+WORKLOAD_PROFILES = {
+    "1 — Low (background, won't impact system)": "1",
+    "2 — Default (balanced)": "2",
+    "3 — High (recommended for dedicated cracking rigs)": "3",
+    "4 — Nightmare (max, may freeze desktop)": "4",
 }
 
 
@@ -73,21 +80,21 @@ class Wizard:
         self._execute_configuration(config)
 
     def _collect_configuration(self) -> Optional[dict]:
-        """Collect all configuration parameters from user with step-by-step navigation."""
+        """Collect all configuration parameters with corrected step order."""
         config = {}
 
-        # Define wizard steps
+        # Steps ordered logically: know what you're cracking before picking wordlists
         steps = [
-            ("Select Wordlists", self._step_select_wordlists),
-            ("Select Rules", self._step_select_rules),
-            ("Configure Notifications", self._step_configure_webhook),
             ("Specify Hash File", self._step_get_hash_file),
             ("Detect Hash Mode", self._step_determine_hash_mode),
             ("Choose Attack Mode", self._step_choose_attack_mode),
+            ("Select Wordlists", self._step_select_wordlists),
+            ("Select Rules", self._step_select_rules),
+            ("Output & Options", self._step_output_options),
+            ("Configure Notifications", self._step_configure_webhook),
         ]
 
         current_step = 0
-
         while current_step < len(steps):
             step_name, step_func = steps[current_step]
             self.console.print(f"\n[bold cyan]Step {current_step + 1}/{len(steps)}: {step_name}[/bold cyan]")
@@ -102,68 +109,18 @@ class Wizard:
             elif result == "next":
                 current_step += 1
             else:
-                # Should not happen, but handle gracefully
                 current_step += 1
 
         return config
 
-    def _step_select_wordlists(self, config: dict, can_go_back: bool) -> str:
-        """Step 1: Select wordlists."""
-        wordlist_keys = self._pick_assets_with_back("wordlists", can_go_back)
-
-        if wordlist_keys == "back":
-            return "back"
-        elif wordlist_keys == "cancel":
-            return "cancel"
-        elif not wordlist_keys:
-            self.console.print(cat_say("No wordlists selected. Hashcat requires at least one wordlist."))
-            if questionary.confirm("Try again?", default=True).ask():
-                return self._step_select_wordlists(config, can_go_back)
-            else:
-                return "cancel"
-
-        self.asset_manager.sync(wordlist_keys)
-        config['wordlist_keys'] = wordlist_keys
-        return "next"
-
-    def _step_select_rules(self, config: dict, can_go_back: bool) -> str:
-        """Step 2: Select rules."""
-        self.console.print(cat_say("Rules are optional but highly recommended for better cracking results."))
-        rule_keys = self._pick_assets_with_back("rules", can_go_back)
-
-        if rule_keys == "back":
-            return "back"
-        elif rule_keys == "cancel":
-            return "cancel"
-        elif not rule_keys:
-            self.console.print(cat_say("No rules selected. Proceeding with straight wordlist attack."))
-        else:
-            self.asset_manager.sync(rule_keys)
-
-        config['rule_keys'] = rule_keys if rule_keys not in ["back", "cancel"] else []
-        return "next"
-
-    def _step_configure_webhook(self, config: dict, can_go_back: bool) -> str:
-        """Step 3: Configure Discord webhook."""
-        webhook = self._prompt_discord_with_back(can_go_back)
-
-        if webhook == "back":
-            return "back"
-        elif webhook == "cancel":
-            return "cancel"
-
-        config['webhook'] = webhook
-        return "next"
-
     def _step_get_hash_file(self, config: dict, can_go_back: bool) -> str:
-        """Step 4: Get hash file path."""
+        """Step 1: Get hash file path."""
         hashes_dir = self.config.hashes_dir
-        self.console.print(cat_say(f"Upload your hash files to: {hashes_dir}"))
-
+        self.console.print(cat_say(f"Default hash directory: {hashes_dir}"))
         default_hash_path = str(hashes_dir / "hash.txt")
 
         while True:
-            prompt_text = "Path to your hash file (or 'back' to go back)"
+            prompt_text = "Path to your hash file (or 'back')" if can_go_back else "Path to your hash file"
             hash_path = questionary.text(prompt_text, default=default_hash_path).ask()
 
             if hash_path and hash_path.lower() == "back" and can_go_back:
@@ -171,70 +128,247 @@ class Wizard:
 
             expanded_path = Path(hash_path).expanduser()
             if expanded_path.exists():
-                config['hash_path'] = hash_path
+                config['hash_path'] = str(expanded_path)
+                # Show sample so user can verify
+                from .detect import sample_from_file
+                sample = sample_from_file(str(expanded_path))
+                if sample:
+                    self.console.print(f"[dim]Sample: {sample[:64]}[/dim]")
                 return "next"
 
-            self.console.print(cat_say(f"File not found: {expanded_path}. Please try again."))
+            self.console.print(f"[red]File not found:[/red] {expanded_path}")
             if not questionary.confirm("Try another path?", default=True).ask():
-                if can_go_back and questionary.confirm("Go back to previous step?", default=False).ask():
+                if can_go_back and questionary.confirm("Go back?", default=False).ask():
                     return "back"
                 return "cancel"
 
     def _step_determine_hash_mode(self, config: dict, can_go_back: bool) -> str:
-        """Step 5: Determine hash mode."""
+        """Step 2: Determine hash mode."""
         hash_mode = self._determine_hash_mode_with_back(config['hash_path'], can_go_back)
-
         if hash_mode == "back":
             return "back"
-        elif hash_mode == "cancel":
+        if hash_mode == "cancel":
             return "cancel"
-
         config['hash_mode'] = hash_mode
         return "next"
 
     def _step_choose_attack_mode(self, config: dict, can_go_back: bool) -> str:
-        """Step 6: Choose attack mode."""
+        """Step 3: Choose attack mode. Gate on what makes sense for the hash type."""
         choices = list(ATTACK_MODES.keys())
         if can_go_back:
             choices.append("← Go back")
 
         attack_choice = questionary.select("Choose attack mode", choices=choices).ask()
-
         if attack_choice == "← Go back":
             return "back"
 
         config['attack_mode'] = ATTACK_MODES[attack_choice]
         config['attack_choice'] = attack_choice
+
+        # For mask-based modes, collect the mask pattern now
+        if config['attack_mode'] in ("3", "6"):
+            result = self._step_get_mask(config, can_go_back=True)
+            if result != "next":
+                return result
+
+        return "next"
+
+    def _step_get_mask(self, config: dict, can_go_back: bool) -> str:
+        """Collect mask pattern for attack modes 3 and 6."""
+        self.console.print(cat_say(
+            "Mask syntax: ?l=lower ?u=upper ?d=digit ?s=symbol ?a=all\n"
+            "  Examples: ?u?l?l?l?d?d?d?d  (8-char: Cap+3lower+4digits)\n"
+            "            ?a?a?a?a?a?a?a?a  (8-char: any)\n"
+            "            Password?d?d?d?d  (literal prefix + 4 digits)"
+        ))
+        while True:
+            mask = questionary.text("Enter mask pattern (or 'back')").ask()
+            if mask and mask.lower() == "back":
+                return "back"
+            if mask and mask.strip():
+                config['mask'] = mask.strip()
+                return "next"
+            self.console.print("[red]Mask cannot be empty.[/red]")
+
+    def _step_select_wordlists(self, config: dict, can_go_back: bool) -> str:
+        """Step 4: Select wordlists. Skipped for pure mask attack (mode 3)."""
+        attack_mode = config.get('attack_mode', '0')
+
+        if attack_mode == "3":
+            config['wordlist_keys'] = []
+            return "next"
+
+        need_two = (attack_mode == "1")
+        if need_two:
+            self.console.print(cat_say("Combinator mode needs exactly two wordlists. They will be combined pairwise."))
+
+        while True:
+            wordlist_keys = self._pick_assets_with_back("wordlists", can_go_back)
+            if wordlist_keys == "back":
+                return "back"
+            if wordlist_keys == "cancel":
+                return "cancel"
+            if not wordlist_keys:
+                self.console.print(cat_say("No wordlists selected. At least one is required."))
+                if questionary.confirm("Try again?", default=True).ask():
+                    continue
+                return "cancel"
+            if need_two and len(wordlist_keys) < 2:
+                self.console.print(cat_say("Combinator mode requires two wordlists. Please select at least two."))
+                if questionary.confirm("Try again?", default=True).ask():
+                    continue
+                return "cancel"
+            break
+
+        self.asset_manager.sync(wordlist_keys)
+        failed = getattr(self.asset_manager, 'errors', {})
+        for key, err in failed.items():
+            self.console.print(f"[yellow]⚠  {key}:[/yellow] {err}")
+        succeeded = [k for k in wordlist_keys if k not in failed]
+        if not succeeded:
+            self.console.print(cat_say("All wordlist downloads failed."))
+            if questionary.confirm("Try again?", default=True).ask():
+                return self._step_select_wordlists(config, can_go_back)
+            return "cancel"
+        if failed:
+            self.console.print(f"[yellow]Continuing with {len(succeeded)}/{len(wordlist_keys)} wordlists.[/yellow]")
+        if need_two and len(succeeded) < 2:
+            self.console.print(cat_say("Need two working wordlists for combinator mode. Please try again."))
+            if questionary.confirm("Try again?", default=True).ask():
+                return self._step_select_wordlists(config, can_go_back)
+            return "cancel"
+
+        # Warn if multiple selected for straight mode
+        if attack_mode == "0" and len(succeeded) > 1:
+            self.console.print(
+                f"[yellow]Note:[/yellow] Straight mode uses one wordlist at a time. "
+                f"Only [bold]{succeeded[0]}[/bold] will be used. "
+                "To use multiple, concatenate them first."
+            )
+
+        config['wordlist_keys'] = succeeded
+        return "next"
+
+    def _step_select_rules(self, config: dict, can_go_back: bool) -> str:
+        """Step 5: Select rules. Only applicable for modes 0 and 6."""
+        attack_mode = config.get('attack_mode', '0')
+
+        if attack_mode in ("1", "3"):
+            config['rule_keys'] = []
+            return "next"
+
+        self.console.print(cat_say("Rules multiply wordlist coverage — highly recommended for straight attacks."))
+        rule_keys = self._pick_assets_with_back("rules", can_go_back)
+
+        if rule_keys == "back":
+            return "back"
+        if rule_keys == "cancel":
+            return "cancel"
+        if not rule_keys:
+            self.console.print(cat_say("No rules — proceeding with straight wordlist attack."))
+        else:
+            self.asset_manager.sync(rule_keys)
+            failed = getattr(self.asset_manager, 'errors', {})
+            for key, err in failed.items():
+                self.console.print(f"[yellow]⚠  {key}:[/yellow] {err}")
+            rule_keys = [k for k in rule_keys if k not in failed]
+            if failed and rule_keys:
+                self.console.print(f"[yellow]Continuing with {len(rule_keys)} rule(s).[/yellow]")
+
+        config['rule_keys'] = rule_keys if isinstance(rule_keys, list) else []
+        return "next"
+
+    def _step_output_options(self, config: dict, can_go_back: bool) -> str:
+        """Step 6: Output file, workload profile, extra flags."""
+        choices = list(WORKLOAD_PROFILES.keys())
+        if can_go_back:
+            choices.append("← Go back")
+
+        workload_choice = questionary.select(
+            "Workload profile (affects GPU/CPU usage)",
+            choices=choices,
+            default=choices[1],  # Default
+        ).ask()
+        if workload_choice == "← Go back":
+            return "back"
+        config['workload'] = WORKLOAD_PROFILES[workload_choice]
+
+        output_path = questionary.text(
+            "Output file for cracked passwords (leave blank to skip)",
+            default="",
+        ).ask()
+        config['output_file'] = output_path.strip() or None
+
+        # Offer --show to dump already-cracked hashes from potfile
+        if questionary.confirm("Check potfile for already-cracked hashes before running?", default=True).ask():
+            config['show_potfile'] = True
+        else:
+            config['show_potfile'] = False
+
+        return "next"
+
+    def _step_configure_webhook(self, config: dict, can_go_back: bool) -> str:
+        """Step 7: Configure notifications."""
+        self.console.print(cat_say("Get notified when cracking finishes. All fields optional."))
+
+        if can_go_back and questionary.confirm("Skip notifications?", default=True).ask():
+            config['webhook'] = None
+            config['slack_webhook'] = None
+            config['pushover_token'] = None
+            config['pushover_user'] = None
+            return "next"
+
+        default_discord = self.config.get("discord_webhook") or ""
+        discord = questionary.text("Discord webhook URL (blank to skip)", default=default_discord).ask()
+        if discord and discord.lower() == "back" and can_go_back:
+            return "back"
+        if discord:
+            self.config.set("discord_webhook", discord)
+
+        slack = questionary.text("Slack webhook URL (blank to skip)", default="").ask()
+        if slack:
+            self.config.set("slack_webhook", slack)
+
+        pushover_token = questionary.text("Pushover app token (blank to skip)", default=self.config.get("pushover_token") or "").ask()
+        pushover_user = ""
+        if pushover_token:
+            pushover_user = questionary.text("Pushover user key", default=self.config.get("pushover_user") or "").ask()
+            if pushover_token:
+                self.config.set("pushover_token", pushover_token)
+            if pushover_user:
+                self.config.set("pushover_user", pushover_user)
+
+        config['webhook'] = discord or None
+        config['slack_webhook'] = slack or None
+        config['pushover_token'] = pushover_token or None
+        config['pushover_user'] = pushover_user or None
         return "next"
 
     def _pick_assets_with_back(self, category: str, can_go_back: bool):
-        """Pick assets with back navigation support."""
+        """Pick assets with back navigation support. Cached assets are marked."""
         keys = list_assets(category)
         if not keys:
             return []
 
-        # Display available options
-        self.console.print(f"\n[bold]Available {category}:[/bold]")
+        self.console.print(f"\n[bold]Available {category}:[/bold] [dim]([green]●[/green] = already cached)[/dim]")
 
-        # For rules, add a "no rules" option at index 0
         if category == "rules":
             self.console.print(f"  [cyan]0[/cyan]. No rules (straight wordlist attack)")
 
         for idx, key in enumerate(keys, 1):
             asset = ASSET_LIBRARY[key]
-            self.console.print(f"  [cyan]{idx}[/cyan]. {key}: [dim]{asset.description}[/dim]")
+            cached = self.asset_manager._output_path(asset).exists()
+            marker = "[green]●[/green] " if cached else "  "
+            self.console.print(f"  {marker}[cyan]{idx}[/cyan]. {key}: [dim]{asset.description}[/dim]")
 
-        # Get selection
         self.console.print(f"\n[bold]Enter numbers to select {category}:[/bold]")
         if category == "rules":
-            examples = "'0' (no rules), '1' (single), '1,2' (multiple), '1-3' (range), 'all' (select all)"
+            examples = "'0' (none), '1', '1,2', '1-3', 'all'"
         else:
-            examples = "'1' (single), '1,2' (multiple), '1-3' (range), 'all' (select all)"
-
+            examples = "'1', '1,2', '1-3', 'all'"
         if can_go_back:
-            examples += ", 'back' (go back)"
-
-        self.console.print(f"[dim]Examples: {examples}[/dim]")
+            examples += ", 'back'"
+        self.console.print(f"[dim]{examples}[/dim]")
 
         selection = questionary.text(
             f"Select {category}",
@@ -243,21 +377,15 @@ class Wizard:
 
         if not selection or selection.strip() == "":
             return []
-
-        # Check for back command
         if selection.strip().lower() == "back" and can_go_back:
             return "back"
-
-        # Handle "0" for no rules
         if category == "rules" and selection.strip() == "0":
-            self.console.print(f"[green]✓[/green] No rules selected (straight wordlist attack)")
+            self.console.print(f"[green]✓[/green] No rules")
             return []
 
-        # Parse selection
         try:
             selected_indices = self._parse_selection(selection.strip(), len(keys))
             selected_keys = [keys[i] for i in selected_indices]
-
             if selected_keys:
                 self.console.print(f"[green]✓[/green] Selected {len(selected_keys)} {category}: {', '.join(selected_keys)}")
             return selected_keys
@@ -321,19 +449,25 @@ class Wizard:
 
     def _show_configuration_summary(self, config: dict) -> None:
         """Display current configuration to user."""
-        wordlist_paths = self.asset_manager.resolved_paths(config['wordlist_keys'])
-        rule_paths = self.asset_manager.resolved_paths(config['rule_keys'])
+        wordlist_paths = self.asset_manager.resolved_paths(config.get('wordlist_keys', []))
+        rule_paths = self.asset_manager.resolved_paths(config.get('rule_keys', []))
 
         self.console.rule(cat_say("Configuration Summary"))
-        self.console.print(f"[bold]1. Hash file:[/bold] {config['hash_path']}")
-        self.console.print(f"[bold]2. Hash mode:[/bold] {config['hash_mode']}")
-        self.console.print(f"[bold]3. Attack mode:[/bold] {config['attack_choice']}")
-        self.console.print(f"[bold]4. Wordlists:[/bold] {', '.join([p.name for p in wordlist_paths])}")
+        self.console.print(f"[bold]Hash file:[/bold]    {config.get('hash_path')}")
+        self.console.print(f"[bold]Hash mode:[/bold]    {config.get('hash_mode')}")
+        self.console.print(f"[bold]Attack mode:[/bold]  {config.get('attack_choice')}")
+        if config.get('mask'):
+            self.console.print(f"[bold]Mask:[/bold]         {config['mask']}")
+        if wordlist_paths:
+            self.console.print(f"[bold]Wordlists:[/bold]    {', '.join(p.name for p in wordlist_paths)}")
         if rule_paths:
-            self.console.print(f"[bold]5. Rules:[/bold] {', '.join([p.name for p in rule_paths])}")
+            self.console.print(f"[bold]Rules:[/bold]        {', '.join(p.name for p in rule_paths)}")
         else:
-            self.console.print(f"[bold]5. Rules:[/bold] None (straight attack)")
-        self.console.print(f"[bold]6. Discord webhook:[/bold] {'Configured' if config['webhook'] else 'Not configured'}\n")
+            self.console.print(f"[bold]Rules:[/bold]        None")
+        self.console.print(f"[bold]Workload:[/bold]     -{config.get('workload', '2')} ({['','Low','Default','High','Nightmare'][int(config.get('workload','2'))]})")
+        self.console.print(f"[bold]Output file:[/bold]  {config.get('output_file') or 'None (use potfile)'}")
+        notifs = [k for k in ('webhook', 'slack_webhook', 'pushover_token') if config.get(k)]
+        self.console.print(f"[bold]Notifications:[/bold] {', '.join(notifs) or 'None'}\n")
 
     def _edit_configuration(self, config: dict) -> bool:
         """Allow user to edit a specific parameter. Returns True if edit was made."""
@@ -376,12 +510,21 @@ class Wizard:
             wordlist_keys = self._pick_assets("wordlists")
             if wordlist_keys:
                 self.asset_manager.sync(wordlist_keys)
-                config['wordlist_keys'] = wordlist_keys
+                failed = getattr(self.asset_manager, 'errors', {})
+                for key, err in failed.items():
+                    self.console.print(f"[yellow]⚠  {key}:[/yellow] {err}")
+                config['wordlist_keys'] = [k for k in wordlist_keys if k not in failed]
         elif choice.startswith("5"):
             # Edit rules
             rule_keys = self._pick_assets("rules")
-            self.asset_manager.sync(rule_keys)
-            config['rule_keys'] = rule_keys
+            if rule_keys:
+                self.asset_manager.sync(rule_keys)
+                failed = getattr(self.asset_manager, 'errors', {})
+                for key, err in failed.items():
+                    self.console.print(f"[yellow]⚠  {key}:[/yellow] {err}")
+                config['rule_keys'] = [k for k in rule_keys if k not in failed]
+            else:
+                config['rule_keys'] = []
         elif choice.startswith("6"):
             # Edit webhook
             config['webhook'] = self._prompt_discord()
@@ -390,9 +533,15 @@ class Wizard:
 
     def _execute_configuration(self, config: dict) -> None:
         """Execute hashcat with the configured parameters."""
-        wordlist_paths = self.asset_manager.resolved_paths(config['wordlist_keys'])
-        rule_paths = self.asset_manager.resolved_paths(config['rule_keys'])
-        notifier = Notifier(config['webhook'])
+        from .notifier import Notifier
+        wordlist_paths = self.asset_manager.resolved_paths(config.get('wordlist_keys', []))
+        rule_paths = self.asset_manager.resolved_paths(config.get('rule_keys', []))
+        notifier = Notifier(
+            discord_webhook=config.get('webhook'),
+            slack_webhook=config.get('slack_webhook'),
+            pushover_token=config.get('pushover_token'),
+            pushover_user=config.get('pushover_user'),
+        )
 
         command = render_hashcat_command(
             hash_path=config['hash_path'],
@@ -400,11 +549,27 @@ class Wizard:
             attack_mode=config['attack_mode'],
             wordlists=self._only_files(wordlist_paths, "wordlist"),
             rules=self._only_files(rule_paths, "rule"),
+            output_file=config.get('output_file'),
+            workload=config.get('workload'),
+            mask=config.get('mask'),
         )
+
+        # Show potfile hits before running
+        if config.get('show_potfile'):
+            show_cmd = f"hashcat -m {config['hash_mode']} {config['hash_path']} --show"
+            self.console.print(f"\n[bold]Already cracked (--show):[/bold]\n[dim]{show_cmd}[/dim]")
+            if questionary.confirm("Run --show now?", default=True).ask():
+                runner = HashcatRunner(notifier=Notifier())
+                try:
+                    runner.ensure_binary()
+                    runner.run(shlex.split(show_cmd)[1:])
+                except Exception:
+                    pass
+
         script = render_startup_script(wordlist_paths + rule_paths)
 
         self.console.rule(cat_say("Hashcat Command"))
-        self.console.print(f"\n[bold]Command:[/bold]\n[italic]{command}[/italic]")
+        self.console.print(f"\n[bold]Command:[/bold]\n[italic]{command}[/italic]\n")
 
         if questionary.confirm("Save startup script to file?", default=True).ask():
             path = Path(questionary.text("Path to save script", default="vastcat-startup.sh").ask())

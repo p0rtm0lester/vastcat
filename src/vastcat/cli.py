@@ -23,42 +23,34 @@ assets_app = typer.Typer(help="Manage wordlists and rules")
 app.add_typer(assets_app, name="assets")
 
 
-def check_hashcat_with_warning(console: Console) -> bool:
-    """Check if hashcat is installed and warn if not."""
-    if shutil.which("hashcat"):
+def check_hashcat_with_warning(console: Console, auto_install: bool = False) -> bool:
+    """Check if hashcat is installed and warn if not.
+
+    Returns True if hashcat is available. When auto_install=True will attempt
+    installation without prompting (used by the `run` command); otherwise just
+    warns and lets the wizard continue so the user can still generate scripts.
+    """
+    from .install_hashcat import check_hashcat_installed, download_and_install_hashcat
+
+    if check_hashcat_installed():
         return True
 
-    # Try automatic installation
-    console.print("\n[bold yellow]⚠️  Hashcat is not installed![/bold yellow]")
-    console.print("[dim]Attempting automatic installation...[/dim]\n")
+    console.print("\n[bold yellow]⚠️  Hashcat not found.[/bold yellow]")
 
-    try:
-        from .install_hashcat import download_and_install_hashcat
-
-        # Suppress verbose output during automatic installation
-        import io
-        import sys
-        old_stdout = sys.stdout
-        sys.stdout = io.StringIO()
-
+    if auto_install:
+        console.print("[dim]Attempting installation...[/dim]\n")
         try:
-            success = download_and_install_hashcat(verbose=False)
-        finally:
-            sys.stdout = old_stdout
+            success = download_and_install_hashcat(verbose=True)
+            if success and check_hashcat_installed():
+                console.print("[green]✓ Hashcat installed.[/green]\n")
+                return True
+        except Exception as exc:
+            console.print(f"[yellow]Installation failed: {exc}[/yellow]")
 
-        if success and shutil.which("hashcat"):
-            console.print("[green]✓ Hashcat installed successfully![/green]\n")
-            return True
-        else:
-            console.print("[yellow]⚠️  Automatic installation failed[/yellow]\n")
-    except Exception as e:
-        console.print(f"[yellow]⚠️  Automatic installation failed: {e}[/yellow]\n")
-
-    console.print("[dim]Please install hashcat manually:[/dim]")
-    console.print("  [cyan]vastcat install-hashcat[/cyan]  (for instructions)")
-    console.print("\n[dim]Or install directly:[/dim]")
+    console.print("[dim]Install hashcat to run jobs locally:[/dim]")
+    console.print("  [cyan]vastcat install-hashcat[/cyan]  — platform instructions")
     console.print("  [dim]Ubuntu/Debian: sudo apt install hashcat[/dim]")
-    console.print("  [dim]macOS: brew install hashcat[/dim]\n")
+    console.print("  [dim]macOS:         brew install hashcat[/dim]\n")
     return False
 
 
@@ -100,7 +92,7 @@ def run(
 ) -> None:
     """Run hashcat with manual parameters."""
     console = Console()
-    if not check_hashcat_with_warning(console):
+    if not check_hashcat_with_warning(console, auto_install=True):
         raise typer.Exit(1)
 
     command = render_hashcat_command(
@@ -119,7 +111,7 @@ def run(
 def wizard() -> None:
     """Start the interactive configuration wizard."""
     console = Console()
-    check_hashcat_with_warning(console)
+    check_hashcat_with_warning(console, auto_install=False)
     Wizard(console).run()
 
 

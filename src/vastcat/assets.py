@@ -50,15 +50,6 @@ ASSET_LIBRARY: Dict[str, Asset] = {
         output_name="10k-most-common.txt",
         description="10,000 most common passwords",
     ),
-    "weakpass_3": Asset(
-        name="weakpass_3",
-        category="wordlists",
-        url="https://download.weakpass.com/wordlists/1947/weakpass_3.7z",
-        filename="weakpass_3.7z",
-        decompress="7z",
-        output_name="weakpass_3",
-        description="Weakpass 3 wordlist (28GB decompressed, large download)",
-    ),
     "seclists_passwords": Asset(
         name="SecLists",
         category="wordlists",
@@ -281,39 +272,6 @@ ASSET_LIBRARY: Dict[str, Asset] = {
         output_name="darkweb2017-top10000.txt",
         description="Dark web 2017 top 10K passwords",
     ),
-    # Leaked database passwords
-    "ashley_madison": Asset(
-        name="Ashley-Madison.txt",
-        category="wordlists",
-        url="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Leaked-Databases/Ashley-Madison.txt",
-        filename="Ashley-Madison.txt",
-        output_name="Ashley-Madison.txt",
-        description="Ashley Madison breach passwords",
-    ),
-    "phpbb": Asset(
-        name="phpbb.txt",
-        category="wordlists",
-        url="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Leaked-Databases/phpbb.txt",
-        filename="phpbb.txt",
-        output_name="phpbb.txt",
-        description="phpBB leaked passwords",
-    ),
-    "myspace": Asset(
-        name="myspace.txt",
-        category="wordlists",
-        url="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Leaked-Databases/myspace.txt",
-        filename="myspace.txt",
-        output_name="myspace.txt",
-        description="MySpace leaked passwords",
-    ),
-    "hotmail": Asset(
-        name="hotmail.txt",
-        category="wordlists",
-        url="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Leaked-Databases/hotmail.txt",
-        filename="hotmail.txt",
-        output_name="hotmail.txt",
-        description="Hotmail leaked passwords",
-    ),
     # Pattern-based wordlists
     "keyboard_walks": Asset(
         name="Keyboard-Combinations.txt",
@@ -323,29 +281,13 @@ ASSET_LIBRARY: Dict[str, Asset] = {
         output_name="Keyboard-Combinations.txt",
         description="Keyboard walk patterns (adjacent key sequences)",
     ),
-    "leetspeak_wordlist": Asset(
-        name="1337speak.txt",
+    "cirt_default": Asset(
+        name="cirt-default-passwords.txt",
         category="wordlists",
-        url="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Permutations/1337speak.txt",
-        filename="1337speak.txt",
-        output_name="1337speak.txt",
-        description="Leetspeak password variations",
-    ),
-    "password_permutations": Asset(
-        name="password-permutations.txt",
-        category="wordlists",
-        url="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Permutations/password-permutations.txt",
-        filename="password-permutations.txt",
-        output_name="password-permutations.txt",
-        description="Common password mutation patterns",
-    ),
-    "darkc0de": Asset(
-        name="darkc0de.txt",
-        category="wordlists",
-        url="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/darkc0de.txt",
-        filename="darkc0de.txt",
-        output_name="darkc0de.txt",
-        description="Darkc0de community wordlist",
+        url="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/cirt-default-passwords.txt",
+        filename="cirt-default-passwords.txt",
+        output_name="cirt-default-passwords.txt",
+        description="CIRT default device passwords",
     ),
     # WiFi/WPA specific
     "wpa_top4800": Asset(
@@ -388,18 +330,45 @@ class AssetManager:
     def __init__(self, config: Optional[Config] = None) -> None:
         self.config = config or ensure_config()
 
-    def sync(self, selection: Optional[Iterable[str]] = None, force: bool = False) -> List[Path]:
-        targets = selection or ASSET_LIBRARY.keys()
+    def sync(
+        self,
+        selection: Optional[Iterable[str]] = None,
+        force: bool = False,
+        raise_on_error: bool = False,
+    ) -> List[Path]:
+        """Download assets. Returns paths of successfully obtained assets.
+
+        On failure, prints a warning per asset and continues unless
+        raise_on_error=True (legacy behaviour).
+        """
+        targets = list(selection or ASSET_LIBRARY.keys())
         downloaded: List[Path] = []
+        self.errors: dict = {}  # key -> error message, inspectable by callers
+
         for key in targets:
             asset = ASSET_LIBRARY.get(key)
             if not asset:
-                raise KeyError(f"Unknown asset '{key}'")
+                msg = f"Unknown asset '{key}'"
+                if raise_on_error:
+                    raise KeyError(msg)
+                self.errors[key] = msg
+                print(f"⚠  {msg}")
+                continue
+
             final_path = self._output_path(asset)
             if final_path.exists() and not force:
                 downloaded.append(final_path)
                 continue
-            downloaded.append(self._download(asset))
+
+            try:
+                downloaded.append(self._download(asset))
+            except Exception as exc:
+                msg = str(exc)
+                self.errors[key] = msg
+                if raise_on_error:
+                    raise
+                print(f"⚠  Failed to download '{key}': {msg}")
+
         return downloaded
 
     def _download_target(self, asset: Asset) -> Path:
@@ -413,10 +382,22 @@ class AssetManager:
     def _download(self, asset: Asset) -> Path:
         target = self._download_target(asset)
         target.parent.mkdir(parents=True, exist_ok=True)
-        with requests.get(asset.url, stream=True, timeout=300) as resp:
-            resp.raise_for_status()
-            total = int(resp.headers.get("content-length", 0))
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        try:
+            resp = requests.get(asset.url, stream=True, timeout=300)
+        except requests.exceptions.ConnectionError as exc:
+            raise RuntimeError(f"Connection error fetching {asset.url}: {exc}") from exc
+        except requests.exceptions.Timeout:
+            raise RuntimeError(f"Timed out fetching {asset.url}")
+
+        if resp.status_code == 404:
+            raise RuntimeError(f"URL not found (404): {asset.url}")
+        resp.raise_for_status()
+
+        total = int(resp.headers.get("content-length", 0))
+        tmp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(asset.url).suffix) as tmp:
+                tmp_path = Path(tmp.name)
                 progress = tqdm(
                     total=total or None,
                     unit="B",
@@ -428,7 +409,11 @@ class AssetManager:
                         tmp.write(chunk)
                         progress.update(len(chunk))
                 progress.close()
-                tmp_path = Path(tmp.name)
+        except Exception:
+            if tmp_path and tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+            raise
+
         if asset.checksum:
             self._verify_checksum(tmp_path, asset.checksum)
         final_path = self._handle_compression(tmp_path, target, self._output_path(asset), asset)

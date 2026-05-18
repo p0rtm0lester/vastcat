@@ -51,9 +51,12 @@ _REGEXES = {
     # Windows/Domain hashes
     "1000": re.compile(r"^[a-fA-F0-9]{32}:[a-fA-F0-9]{32}$"),  # NTLM (with LM)
     "3000": re.compile(r"^[a-fA-F0-9]{32}$"),  # LM
-    "5500": re.compile(r"^[^:]+::[^:]+:[a-fA-F0-9]{16}:[a-fA-F0-9]{32}:[a-fA-F0-9]+$"),  # NetNTLMv1
-    "5600": re.compile(r"^[^:]+::[^:]+:[a-fA-F0-9]{16}:[a-fA-F0-9]{32}:[a-fA-F0-9]+$"),  # NetNTLMv2
-    "13100": re.compile(r"^\$krb5tgs\$23\$.*"),  # Kerberos TGS
+    "5500": re.compile(r"^[^:]+::[^:]+:[a-fA-F0-9]{16}:[a-fA-F0-9]{32}:[a-fA-F0-9]{0,48}$"),  # NetNTLMv1
+    "5600": re.compile(r"^[^:]+::[^:]+:[a-fA-F0-9]{16}:[a-fA-F0-9]{32}:[a-fA-F0-9]{49,}$"),  # NetNTLMv2 (longer blob)
+    "13100": re.compile(r"^\$krb5tgs\$23\$.*"),   # Kerberos TGS RC4
+    "19600": re.compile(r"^\$krb5tgs\$17\$.*"),   # Kerberos TGS AES-128
+    "19700": re.compile(r"^\$krb5tgs\$18\$.*"),   # Kerberos TGS AES-256
+    "18200": re.compile(r"^\$krb5asrep\$23\$.*"), # AS-REP Roasting
     # Other common formats
     "900": re.compile(r"^\{[A-Z0-9]+\}[a-fA-F0-9]{32}$"),  # MD4
     "1100": re.compile(r"^\{[A-Z0-9]+\}[a-fA-F0-9]{40}$"),  # Domain Cached Credentials (DCC)
@@ -66,9 +69,12 @@ _NAMED_SPECIALS = {
     "1800": HashGuess("sha512crypt", "1800", 0.85, "starts with $6$"),
     "1000": HashGuess("NTLM", "1000", 0.9, "LM:NTLM format"),
     "3000": HashGuess("LM", "3000", 0.8, "32 hex (could be MD5 or LM)"),
-    "5500": HashGuess("NetNTLMv1", "5500", 0.9, "user::domain:challenge:response format"),
-    "5600": HashGuess("NetNTLMv2", "5600", 0.95, "user::domain:challenge:response format"),
-    "13100": HashGuess("Kerberos TGS-REP", "13100", 0.95, "starts with $krb5tgs$"),
+    "5500": HashGuess("NetNTLMv1", "5500", 0.9, "user::domain:challenge:response (short blob)"),
+    "5600": HashGuess("NetNTLMv2", "5600", 0.95, "user::domain:challenge:response (long blob)"),
+    "13100": HashGuess("Kerberos TGS-REP (RC4)", "13100", 0.95, "starts with $krb5tgs$23$"),
+    "19600": HashGuess("Kerberos TGS-REP (AES-128)", "19600", 0.95, "starts with $krb5tgs$17$"),
+    "19700": HashGuess("Kerberos TGS-REP (AES-256)", "19700", 0.95, "starts with $krb5tgs$18$"),
+    "18200": HashGuess("Kerberos AS-REP (RC4)", "18200", 0.95, "starts with $krb5asrep$23$"),
     "900": HashGuess("MD4", "900", 0.8, "{hash} format"),
     "1100": HashGuess("Domain Cached Credentials", "1100", 0.85, "{hash} format"),
 }
