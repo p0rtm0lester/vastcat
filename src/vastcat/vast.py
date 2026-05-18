@@ -15,6 +15,12 @@ class VastError(RuntimeError):
     pass
 
 
+# Minimum CUDA compute capability for hashcat GPU support.
+# 6.0 = Pascal (GTX 1080/1070 era) — anything older is not worth using.
+HASHCAT_MIN_COMPUTE_CAP = 60   # stored as integer, e.g. 86 = compute 8.6
+HASHCAT_MIN_CUDA        = 11.0 # CUDA 11.0+ required for hashcat 6.x
+
+
 @dataclass
 class Offer:
     id: int
@@ -26,7 +32,8 @@ class Offer:
     disk_space: float
     inet_up: float
     inet_down: float
-    cuda_version: str
+    cuda_version: float
+    compute_cap: int   # e.g. 86 = compute 8.6 (Ampere)
     ssh_host: str
     ssh_port: int
 
@@ -42,16 +49,18 @@ class Offer:
             disk_space=float(d.get("disk_space", 0.0)),
             inet_up=float(d.get("inet_up", 0.0)),
             inet_down=float(d.get("inet_down", 0.0)),
-            cuda_version=str(d.get("cuda_max_good", "")),
+            cuda_version=float(d.get("cuda_max_good") or 0),
+            compute_cap=int(d.get("compute_cap") or 0),
             ssh_host=d.get("ssh_host", ""),
             ssh_port=int(d.get("ssh_port", 22)),
         )
 
     def display(self) -> str:
+        cc = f"{self.compute_cap / 10:.1f}" if self.compute_cap else "?"
         return (
             f"${self.hourly:.3f}/hr  {self.num_gpus}x {self.gpu_name} "
-            f"({self.vram_gb:.0f}GB VRAM)  reliability={self.reliability:.2f}  "
-            f"↑{self.inet_up:.0f}/↓{self.inet_down:.0f} Mbps  id={self.id}"
+            f"({self.vram_gb:.0f}GB VRAM)  CUDA {self.cuda_version}  "
+            f"compute {cc}  reliability={self.reliability:.2f}  id={self.id}"
         )
 
 
@@ -122,17 +131,28 @@ class VastClient:
         min_reliability: float = 0.9,
         gpu_name: Optional[str] = None,
         top_n: int = 10,
+        cuda_only: bool = True,
     ) -> List[Offer]:
-        """Search for GPU offers matching the given constraints."""
+        """Search for GPU offers compatible with hashcat CUDA.
+
+        By default (cuda_only=True) filters to NVIDIA CUDA instances with:
+          - CUDA driver >= 11.0
+          - Compute capability >= 6.0 (Pascal / GTX 10xx and newer)
+        """
         import json
         q: Dict[str, Any] = {
-            "verified": {"eq": True},
+            "verified":   {"eq": True},
             "reliability2": {"gte": min_reliability},
-            "dph_total": {"lte": max_hourly},
-            "gpu_ram": {"gte": min_vram_gb * 1024},  # GB → MB
-            "rentable": {"eq": True},
-            "rented": {"eq": False},
+            "dph_total":  {"lte": max_hourly},
+            "gpu_ram":    {"gte": min_vram_gb * 1024},  # GB → MB
+            "rentable":   {"eq": True},
+            "rented":     {"eq": False},
         }
+
+        if cuda_only:
+            q["cuda_max_good"] = {"gte": HASHCAT_MIN_CUDA}
+            q["compute_cap"]   = {"gte": HASHCAT_MIN_COMPUTE_CAP}
+
         if gpu_name:
             q["gpu_name"] = {"eq": gpu_name}
 

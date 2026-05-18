@@ -243,20 +243,25 @@ def vast_destroy(instance_id: int = typer.Argument(..., help="Instance ID to des
 
 @vast_app.command("search")
 def vast_search(
-    max_price: float = typer.Option(0.50, help="Max $/hr"),
-    min_vram: float  = typer.Option(8.0,  help="Min VRAM GB"),
+    max_price:  float = typer.Option(0.50,  help="Max $/hr"),
+    min_vram:   float = typer.Option(8.0,   help="Min VRAM GB"),
+    gpu:        str   = typer.Option(None,  help="Filter by GPU name (e.g. 'RTX 4090')"),
+    no_cuda_filter: bool = typer.Option(False, "--no-cuda-filter", help="Include non-CUDA instances"),
 ) -> None:
-    """Search for available Vast.ai GPU offers."""
+    """Search for hashcat-compatible CUDA GPU offers on Vast.ai."""
     console = Console()
     config = ensure_config()
     api_key = config.get("vast_api_key") or os.environ.get("VAST_API_KEY", "")
     if not api_key:
         console.print("[red]No Vast.ai API key configured.[/red]")
         raise typer.Exit(1)
-    from .vast import VastClient, VastError
+    from .vast import VastClient, VastError, HASHCAT_MIN_COMPUTE_CAP, HASHCAT_MIN_CUDA
+    if not no_cuda_filter:
+        console.print(f"[dim]Filtering: CUDA >= {HASHCAT_MIN_CUDA}, compute >= {HASHCAT_MIN_COMPUTE_CAP/10:.1f} (Pascal+)[/dim]")
     try:
         offers = VastClient(api_key).search_offers(
-            min_vram_gb=min_vram, max_hourly=max_price
+            min_vram_gb=min_vram, max_hourly=max_price,
+            gpu_name=gpu, cuda_only=not no_cuda_filter,
         )
     except VastError as exc:
         console.print(f"[red]{exc}[/red]")
