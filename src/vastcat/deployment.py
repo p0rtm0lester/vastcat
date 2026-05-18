@@ -1,58 +1,156 @@
 """Deployment helpers for Vast.ai and local execution."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import List, Optional
+
+
+@dataclass
+class RemoteAsset:
+    """Describes a file to download on the remote instance."""
+    url: str
+    filename: str          # downloaded filename
+    output_name: str       # final filename after decompression
+    decompress: Optional[str]  # gz | zip | 7z | bz2 | None
+    remote_dir: str        # /root/wordlists or /root/rules
 
 
 def render_onstart_script(
     hash_content: str,
-    wordlist_urls: List[str],
-    rule_urls: List[str],
+    wordlist_assets: List[RemoteAsset],
+    rule_assets: List[RemoteAsset],
     hashcat_command: str,
     output_file: str = "/root/cracked.txt",
+    notification_cmd: Optional[str] = None,
 ) -> str:
-    """Generate a Vast.ai onstart script.
+    """Generate a self-contained Vast.ai onstart script.
 
-    Assumes the instance image already has hashcat installed (e.g. dizcza/docker-hashcat).
-    Downloads wordlists/rules from URLs, writes the hash file inline, then runs hashcat.
+    Downloads all wordlists and rules directly on the instance,
+    handles decompression, then runs hashcat. Only the hash content
+    is embedded inline — nothing needs uploading from the client.
     """
-    wordlist_downloads = "\n".join(
-        f'wget -q -P /root/wordlists/ "{url}"' for url in wordlist_urls
-    )
-    rule_downloads = "\n".join(
-        f'wget -q -P /root/rules/ "{url}"' for url in rule_urls
-    )
+    lines = [
+        "#!/bin/bash",
+        "set -euo pipefail",
+        "exec > /root/vastcat.log 2>&1",
+        "",
+        'echo "[vastcat] Starting at $(date)"',
+        "",
+        "# Install dependencies",
+        "export DEBIAN_FRONTEND=noninteractive",
+        "apt-get update -qq",
+        "apt-get install -y -qq wget curl p7zip-full unzip",
+        "",
+        "# Ensure hashcat is available",
+        "if ! command -v hashcat &>/dev/null; then",
+        "  echo '[vastcat] hashcat not found — installing from source'",
+        "  cd /tmp",
+        "  wget -q https://hashcat.net/files/hashcat-6.2.6.tar.gz -O hashcat.tar.gz",
+        "  tar -xzf hashcat.tar.gz",
+        "  cd hashcat-6.2.6 && make -j$(nproc) && make install",
+        "  cd /",
+        "fi",
+        "",
+        "mkdir -p /root/wordlists /root/rules",
+        "",
+        "# Write hash file inline",
+        "cat > /root/hashes.txt << 'VASTCAT_HASH_EOF'",
+        hash_content.rstrip(),
+        "VASTCAT_HASH_EOF",
+        "",
+    ]
 
-    # Escape hash content for embedding in heredoc
-    safe_hash = hash_content.replace("'", "'\\''")
+    # Wordlist downloads
+    if wordlist_assets:
+        lines.append("# Download wordlists")
+        for asset in wordlist_assets:
+            lines.extend(_download_block(asset))
+        lines.append("")
 
-    return f"""#!/bin/bash
-set -euo pipefail
-exec > /root/vastcat.log 2>&1
+    # Rule downloads
+    if rule_assets:
+        lines.append("# Download rules")
+        for asset in rule_assets:
+            lines.extend(_download_block(asset))
+        lines.append("")
 
-echo "[vastcat] Starting at $(date)"
+    lines += [
+        'echo "[vastcat] All assets ready — launching hashcat"',
+        "",
+        f"{hashcat_command} -o {output_file} --status --status-timer=60",
+        "",
+        'echo "[vastcat] Done at $(date)"',
+        f'echo "[vastcat] Cracked passwords:"',
+        f"cat {output_file} 2>/dev/null || echo '(none)'",
+    ]
 
-mkdir -p /root/wordlists /root/rules
+    if notification_cmd:
+        lines += ["", notification_cmd]
 
-# Write hash file
-cat > /root/hashes.txt << 'HASHEOF'
-{safe_hash}
-HASHEOF
+    return "\n".join(lines) + "\n"
 
-# Download wordlists
-{wordlist_downloads if wordlist_downloads else "echo '[vastcat] No wordlists to download'"}
 
-# Download rules
-{rule_downloads if rule_downloads else "echo '[vastcat] No rules to download'"}
+def _download_block(asset: RemoteAsset) -> List[str]:
+    """Return bash lines to download and decompress one asset."""
+    dl_path = f"{asset.remote_dir}/{asset.filename}"
+    out_path = f"{asset.remote_dir}/{asset.output_name}"
+    lines = [f'echo "[vastcat] Downloading {asset.output_name}..."']
 
-echo "[vastcat] Assets ready, launching hashcat"
+    if asset.decompress == "gz":
+        lines += [
+            f'wget -q "{asset.url}" -O "{dl_path}"',
+            f'gunzip -f "{dl_path}"',
+        ]
+    elif asset.decompress == "zip":
+        lines += [
+            f'wget -q "{asset.url}" -O "{dl_path}"',
+            f'unzip -q -o "{dl_path}" -d "{asset.remote_dir}/"',
+            f'rm -f "{dl_path}"',
+        ]
+    elif asset.decompress == "bz2":
+        lines += [
+            f'wget -q "{asset.url}" -O "{dl_path}"',
+            f'bunzip2 -f "{dl_path}"',
+        ]
+    elif asset.decompress == "7z":
+        lines += [
+            f'wget -q "{asset.url}" -O "{dl_path}"',
+            f'7z x "{dl_path}" -o"{asset.remote_dir}/" -y',
+            f'rm -f "{dl_path}"',
+        ]
+    else:
+        lines.append(f'wget -q "{asset.url}" -O "{out_path}"')
 
-{hashcat_command} -o {output_file} --status --status-timer=60
+    return lines
 
-echo "[vastcat] Done at $(date)"
-cat {output_file} 2>/dev/null || echo "[vastcat] No passwords cracked"
-"""
+
+def remote_assets_from_keys(
+    keys: List[str],
+    remote_dir: str,
+) -> List[RemoteAsset]:
+    """Convert ASSET_LIBRARY keys to RemoteAsset descriptors."""
+    from .assets import ASSET_LIBRARY
+    assets = []
+    for key in keys:
+        a = ASSET_LIBRARY.get(key)
+        if not a:
+            continue
+        filename = a.filename or Path(a.url).name
+        output_name = a.output_name or filename
+        # Strip compression extension for gz/bz2 to get final filename
+        if a.decompress == "gz" and output_name.endswith(".gz"):
+            output_name = output_name[:-3]
+        elif a.decompress == "bz2" and output_name.endswith(".bz2"):
+            output_name = output_name[:-4]
+        assets.append(RemoteAsset(
+            url=a.url,
+            filename=filename,
+            output_name=output_name,
+            decompress=a.decompress,
+            remote_dir=remote_dir,
+        ))
+    return assets
 
 
 def render_hashcat_command(
@@ -117,11 +215,9 @@ def render_hashcat_command(
     return " ".join(parts)
 
 
-def render_startup_script(asset_paths: Iterable[Path]) -> str:
-    """Legacy local startup script — lists asset paths for reference."""
-    lines = ["#!/bin/bash", "# Asset paths for this vastcat job:"]
+def render_startup_script(asset_paths) -> str:
+    """Local script stub listing asset paths."""
+    lines = ["#!/bin/bash", "# Asset paths:"]
     for p in asset_paths:
         lines.append(f"# {p}")
-    lines.append("")
-    lines.append("# Run the generated hashcat command below:")
-    return "\n".join(lines)
+    return "\n".join(lines) + "\n"
