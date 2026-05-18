@@ -20,7 +20,9 @@ from .wizard import Wizard
 
 app = typer.Typer(help="Cat-themed hashcat orchestrator")
 assets_app = typer.Typer(help="Manage wordlists and rules")
+vast_app   = typer.Typer(help="Manage Vast.ai instances")
 app.add_typer(assets_app, name="assets")
+app.add_typer(vast_app,   name="vast")
 
 
 def check_hashcat_with_warning(console: Console, auto_install: bool = False) -> bool:
@@ -188,6 +190,82 @@ def doctor() -> None:
         console.print("  [green]Ready to crack![/green] Run [cyan]vastcat wizard[/cyan] to get started.\n")
     else:
         console.print("  [yellow]Install hashcat to begin.[/yellow] Run [cyan]vastcat install-hashcat[/cyan] for instructions.\n")
+
+
+@vast_app.command("list")
+def vast_list() -> None:
+    """List your running Vast.ai instances."""
+    console = Console()
+    config = ensure_config()
+    api_key = config.get("vast_api_key") or os.environ.get("VAST_API_KEY", "")
+    if not api_key:
+        console.print("[red]No Vast.ai API key configured. Run vastcat wizard or set VAST_API_KEY.[/red]")
+        raise typer.Exit(1)
+    from .vast import VastClient, VastError
+    try:
+        client = VastClient(api_key)
+        instances = client.list_instances()
+    except VastError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    if not instances:
+        console.print(cat_say("No active instances."))
+        return
+    for inst in instances:
+        console.print(
+            f"[bold]{inst.id}[/bold]  {inst.status:10}  {inst.num_gpus}x {inst.gpu_name}"
+            f"  ${inst.hourly:.3f}/hr  ssh -p {inst.ssh_port} root@{inst.ssh_host}"
+            + (f"  [{inst.label}]" if inst.label else "")
+        )
+
+
+@vast_app.command("destroy")
+def vast_destroy(instance_id: int = typer.Argument(..., help="Instance ID to destroy")) -> None:
+    """Destroy a Vast.ai instance."""
+    console = Console()
+    config = ensure_config()
+    api_key = config.get("vast_api_key") or os.environ.get("VAST_API_KEY", "")
+    if not api_key:
+        console.print("[red]No Vast.ai API key configured.[/red]")
+        raise typer.Exit(1)
+    from .vast import VastClient, VastError
+    import questionary
+    if not questionary.confirm(f"Destroy instance {instance_id}?", default=False).ask():
+        console.print("Cancelled.")
+        return
+    try:
+        VastClient(api_key).destroy_instance(instance_id)
+        console.print(cat_say(f"Instance {instance_id} destroyed."))
+    except VastError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+
+@vast_app.command("search")
+def vast_search(
+    max_price: float = typer.Option(0.50, help="Max $/hr"),
+    min_vram: float  = typer.Option(8.0,  help="Min VRAM GB"),
+) -> None:
+    """Search for available Vast.ai GPU offers."""
+    console = Console()
+    config = ensure_config()
+    api_key = config.get("vast_api_key") or os.environ.get("VAST_API_KEY", "")
+    if not api_key:
+        console.print("[red]No Vast.ai API key configured.[/red]")
+        raise typer.Exit(1)
+    from .vast import VastClient, VastError
+    try:
+        offers = VastClient(api_key).search_offers(
+            min_vram_gb=min_vram, max_hourly=max_price
+        )
+    except VastError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    if not offers:
+        console.print(cat_say("No offers found. Try raising --max-price or lowering --min-vram."))
+        return
+    for o in offers:
+        console.print(o.display())
 
 
 @app.command(name="install-hashcat")

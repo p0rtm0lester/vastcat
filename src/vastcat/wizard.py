@@ -12,7 +12,7 @@ from questionary import Choice
 
 from .assets import ASSET_LIBRARY, AssetManager, list_assets
 from .config import ensure_config
-from .deployment import render_hashcat_command, render_startup_script
+from .deployment import render_hashcat_command, render_onstart_script, render_startup_script
 from .detect import HashGuess, detect_hash_modes, sample_from_file
 from .hashcat import HashcatRunner
 from .notifier import Notifier
@@ -92,6 +92,7 @@ class Wizard:
             ("Select Rules", self._step_select_rules),
             ("Output & Options", self._step_output_options),
             ("Configure Notifications", self._step_configure_webhook),
+            ("Deploy to Vast.ai", self._step_vast_deploy),
         ]
 
         current_step = 0
@@ -344,6 +345,105 @@ class Wizard:
         config['pushover_user'] = pushover_user or None
         return "next"
 
+    # Known Docker images that have hashcat pre-installed
+    HASHCAT_IMAGES = [
+        "dizcza/docker-hashcat:latest",
+        "dizcza/docker-hashcat:cuda11.7",
+        "nvidia/cuda:12.2.0-runtime-ubuntu22.04",  # base, hashcat not included
+    ]
+
+    def _step_vast_deploy(self, config: dict, can_go_back: bool) -> str:
+        """Step 8: Optionally deploy to Vast.ai."""
+        choices = ["Deploy to Vast.ai", "Run locally / generate script only"]
+        if can_go_back:
+            choices.append("← Go back")
+        choice = questionary.select("Where do you want to run hashcat?", choices=choices).ask()
+
+        if choice == "← Go back":
+            return "back"
+
+        config['vast_deploy'] = (choice == "Deploy to Vast.ai")
+        if not config['vast_deploy']:
+            return "next"
+
+        # API key
+        saved_key = self.config.get("vast_api_key") or ""
+        api_key = questionary.text("Vast.ai API key", default=saved_key).ask()
+        if not api_key or not api_key.strip():
+            self.console.print("[red]API key required.[/red]")
+            config['vast_deploy'] = False
+            return "next"
+        api_key = api_key.strip()
+        self.config.set("vast_api_key", api_key)
+        config['vast_api_key'] = api_key
+
+        # Docker image / template
+        saved_image = self.config.get("vast_image") or self.HASHCAT_IMAGES[0]
+        image_choices = self.HASHCAT_IMAGES.copy()
+        if saved_image not in image_choices:
+            image_choices.insert(0, saved_image)
+        image_choices.append("Enter custom image...")
+
+        img_choice = questionary.select(
+            "Docker image (choose a hashcat template or enter custom)",
+            choices=image_choices,
+            default=saved_image if saved_image in image_choices else image_choices[0],
+        ).ask()
+
+        if img_choice == "Enter custom image...":
+            img_choice = questionary.text("Docker image", default=saved_image).ask()
+
+        config['vast_image'] = img_choice or self.HASHCAT_IMAGES[0]
+        self.config.set("vast_image", config['vast_image'])
+
+        # GPU filters
+        max_price = questionary.text("Max price per hour (USD)", default="0.50").ask()
+        min_vram  = questionary.text("Min GPU VRAM (GB)", default="8").ask()
+        disk_gb   = questionary.text("Disk space (GB)", default=str(self.config.get("vast_disk_gb", 20))).ask()
+        try:
+            config['vast_max_price'] = float(max_price)
+            config['vast_min_vram']  = float(min_vram)
+            config['vast_disk_gb']   = int(disk_gb)
+        except ValueError:
+            config['vast_max_price'] = 0.50
+            config['vast_min_vram']  = 8.0
+            config['vast_disk_gb']   = 20
+        self.config.set("vast_disk_gb", config['vast_disk_gb'])
+
+        # Search offers
+        self.console.print(cat_say("Searching Vast.ai for matching GPUs..."))
+        try:
+            from .vast import VastClient
+            client = VastClient(api_key)
+            offers = client.search_offers(
+                min_vram_gb=config['vast_min_vram'],
+                max_hourly=config['vast_max_price'],
+                top_n=10,
+            )
+        except Exception as exc:
+            self.console.print(f"[red]Vast.ai search failed:[/red] {exc}")
+            config['vast_deploy'] = False
+            return "next"
+
+        if not offers:
+            self.console.print(cat_say("No offers found matching your filters. Try raising max price or lowering VRAM."))
+            config['vast_deploy'] = False
+            return "next"
+
+        offer_choices = [o.display() for o in offers]
+        offer_choices.append("← Cancel Vast.ai deployment")
+        selected = questionary.select("Select a GPU instance", choices=offer_choices).ask()
+
+        if selected == "← Cancel Vast.ai deployment":
+            config['vast_deploy'] = False
+            return "next"
+
+        selected_offer = offers[offer_choices.index(selected)]
+        config['vast_offer'] = selected_offer
+        self.console.print(f"[green]✓[/green] Selected: {selected_offer.display()}")
+
+        return "next"
+
     def _pick_assets_with_back(self, category: str, can_go_back: bool):
         """Pick assets with back navigation support. Cached assets are marked."""
         keys = list_assets(category)
@@ -532,10 +632,10 @@ class Wizard:
         return True
 
     def _execute_configuration(self, config: dict) -> None:
-        """Execute hashcat with the configured parameters."""
+        """Execute hashcat — either deploy to Vast.ai or run locally."""
         from .notifier import Notifier
         wordlist_paths = self.asset_manager.resolved_paths(config.get('wordlist_keys', []))
-        rule_paths = self.asset_manager.resolved_paths(config.get('rule_keys', []))
+        rule_paths     = self.asset_manager.resolved_paths(config.get('rule_keys', []))
         notifier = Notifier(
             discord_webhook=config.get('webhook'),
             slack_webhook=config.get('slack_webhook'),
@@ -543,21 +643,49 @@ class Wizard:
             pushover_user=config.get('pushover_user'),
         )
 
-        command = render_hashcat_command(
+        wordlist_files = self._only_files(wordlist_paths, "wordlist")
+        rule_files     = self._only_files(rule_paths, "rule")
+
+        # Remote paths used inside the Vast.ai instance
+        remote_hash      = "/root/hashes.txt"
+        remote_wordlists = [f"/root/wordlists/{Path(w).name}" for w in wordlist_files]
+        remote_rules     = [f"/root/rules/{Path(r).name}"     for r in rule_files]
+        remote_output    = config.get('output_file') or "/root/cracked.txt"
+
+        command_local = render_hashcat_command(
             hash_path=config['hash_path'],
             hash_mode=config['hash_mode'],
             attack_mode=config['attack_mode'],
-            wordlists=self._only_files(wordlist_paths, "wordlist"),
-            rules=self._only_files(rule_paths, "rule"),
+            wordlists=wordlist_files,
+            rules=rule_files,
             output_file=config.get('output_file'),
             workload=config.get('workload'),
             mask=config.get('mask'),
         )
 
-        # Show potfile hits before running
+        command_remote = render_hashcat_command(
+            hash_path=remote_hash,
+            hash_mode=config['hash_mode'],
+            attack_mode=config['attack_mode'],
+            wordlists=remote_wordlists,
+            rules=remote_rules,
+            output_file=remote_output,
+            workload=config.get('workload'),
+            mask=config.get('mask'),
+        )
+
+        self.console.rule(cat_say("Hashcat Command"))
+        self.console.print(f"\n[bold]Command:[/bold]\n[italic]{command_local}[/italic]\n")
+
+        # ── Vast.ai deployment ───────────────────────────────────────────────
+        if config.get('vast_deploy') and config.get('vast_offer'):
+            self._deploy_to_vast(config, wordlist_files, rule_files, command_remote, remote_output, notifier)
+            return
+
+        # ── Local execution ──────────────────────────────────────────────────
         if config.get('show_potfile'):
             show_cmd = f"hashcat -m {config['hash_mode']} {config['hash_path']} --show"
-            self.console.print(f"\n[bold]Already cracked (--show):[/bold]\n[dim]{show_cmd}[/dim]")
+            self.console.print(f"[bold]Check potfile:[/bold] [dim]{show_cmd}[/dim]")
             if questionary.confirm("Run --show now?", default=True).ask():
                 runner = HashcatRunner(notifier=Notifier())
                 try:
@@ -567,28 +695,112 @@ class Wizard:
                     pass
 
         script = render_startup_script(wordlist_paths + rule_paths)
-
-        self.console.rule(cat_say("Hashcat Command"))
-        self.console.print(f"\n[bold]Command:[/bold]\n[italic]{command}[/italic]\n")
-
-        if questionary.confirm("Save startup script to file?", default=True).ask():
-            path = Path(questionary.text("Path to save script", default="vastcat-startup.sh").ask())
-            path.write_text(script)
+        if questionary.confirm("Save script to file?", default=True).ask():
+            path = Path(questionary.text("Path", default="vastcat-run.sh").ask())
+            path.write_text(script + f"\n{command_local}\n")
             os.chmod(path, 0o750)
-            self.console.print(cat_say(f"Script written to {path}"))
+            self.console.print(cat_say(f"Script saved to {path}"))
 
-        self.console.print(cat_say("Ready to run hashcat."))
         if questionary.confirm("Run hashcat locally now?", default=False).ask():
-            hashcat_binary = os.environ.get("HASHCAT_BINARY")
-            runner = HashcatRunner(binary=hashcat_binary, notifier=notifier)
+            runner = HashcatRunner(binary=os.environ.get("HASHCAT_BINARY"), notifier=notifier)
             try:
                 runner.ensure_binary()
-                runner.run(shlex.split(command)[1:])
+                runner.run(shlex.split(command_local)[1:])
             except FileNotFoundError as exc:
                 self.console.print(f"[red]{exc}[/red]")
             except PermissionError as exc:
-                self.console.print(f"[red]Error:[/red] {exc}")
-                self.console.print(cat_say("Make sure hashcat binary has execute permissions."))
+                self.console.print(f"[red]Permission error:[/red] {exc}")
+
+    def _deploy_to_vast(
+        self,
+        config: dict,
+        wordlist_files: List[str],
+        rule_files: List[str],
+        remote_command: str,
+        remote_output: str,
+        notifier,
+    ) -> None:
+        """Create a Vast.ai instance, upload assets, and launch hashcat."""
+        from .vast import VastClient, VastError
+
+        offer = config['vast_offer']
+        client = VastClient(config['vast_api_key'])
+
+        # Build the onstart script
+        hash_content = Path(config['hash_path']).read_text(errors='ignore')
+
+        # Assets already on the local machine — upload via SCP after boot
+        # onstart just sets up dirs and waits
+        onstart = f"""#!/bin/bash
+mkdir -p /root/wordlists /root/rules
+echo vastcat-ready > /root/.vastcat_ready
+"""
+
+        self.console.print(cat_say(f"Creating instance on offer {offer.id} ({offer.gpu_name})..."))
+        try:
+            instance = client.create_instance(
+                offer_id=offer.id,
+                image=config['vast_image'],
+                disk_gb=config.get('vast_disk_gb', 20),
+                label="vastcat",
+                onstart=onstart,
+            )
+        except VastError as exc:
+            self.console.print(f"[red]Failed to create instance:[/red] {exc}")
+            return
+
+        self.console.print(f"[green]✓[/green] Instance {instance.id} created — waiting for it to boot...")
+        notifier.notify("Vastcat", f"Instance {instance.id} created on {offer.gpu_name}")
+
+        try:
+            instance = client.wait_for_running(instance.id, timeout_s=300, poll_s=10)
+        except VastError as exc:
+            self.console.print(f"[red]Instance failed to start:[/red] {exc}")
+            return
+
+        self.console.print(f"[green]✓[/green] Instance running — SSH: {client.ssh_command(instance)}")
+
+        # Upload hash file
+        self.console.print("Uploading hash file...")
+        try:
+            client.upload_file(instance, config['hash_path'], "/root/hashes.txt")
+        except VastError as exc:
+            self.console.print(f"[red]Upload failed:[/red] {exc}")
+
+        # Upload wordlists
+        for wl in wordlist_files:
+            self.console.print(f"Uploading {Path(wl).name}...")
+            try:
+                client.upload_file(instance, wl, f"/root/wordlists/{Path(wl).name}")
+            except VastError as exc:
+                self.console.print(f"[yellow]⚠ {Path(wl).name}:[/yellow] {exc}")
+
+        # Upload rules
+        for rl in rule_files:
+            self.console.print(f"Uploading {Path(rl).name}...")
+            try:
+                client.upload_file(instance, rl, f"/root/rules/{Path(rl).name}")
+            except VastError as exc:
+                self.console.print(f"[yellow]⚠ {Path(rl).name}:[/yellow] {exc}")
+
+        # Launch hashcat in a screen/nohup so it persists after SSH exits
+        launch_cmd = f"nohup {remote_command} > /root/hashcat.log 2>&1 &"
+        self.console.print("Launching hashcat...")
+        try:
+            client.run_remote(instance, launch_cmd)
+            self.console.print(cat_say("Hashcat is running on Vast.ai!"))
+            notifier.notify("Vastcat", f"Hashcat running on instance {instance.id} ({offer.gpu_name})")
+        except VastError as exc:
+            self.console.print(f"[red]Failed to launch hashcat:[/red] {exc}")
+            return
+
+        self.console.rule("Instance Info")
+        self.console.print(f"[bold]Instance ID:[/bold]  {instance.id}")
+        self.console.print(f"[bold]SSH:[/bold]          {client.ssh_command(instance)}")
+        self.console.print(f"[bold]Monitor:[/bold]      ssh ... 'tail -f /root/hashcat.log'")
+        self.console.print(f"[bold]Results:[/bold]      ssh ... 'cat {remote_output}'")
+        self.console.print(f"[bold]Destroy:[/bold]      vastcat vast destroy {instance.id}")
+        self.console.print(f"\n[dim]Cost: ~${offer.hourly:.3f}/hr — remember to destroy when done![/dim]\n")
 
     def _pick_assets(self, category: str) -> List[str]:
         """Pick assets using a numbered menu (more reliable than arrow keys)."""
