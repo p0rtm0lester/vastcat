@@ -136,9 +136,8 @@ class VastClient:
         if gpu_name:
             q["gpu_name"] = {"eq": gpu_name}
 
-        data = self._get("/bundles/", {"q": json.dumps(q), "order": "dph_total"})
+        data = self._get("/bundles/", {"q": json.dumps(q)})
         offers = data.get("offers", [])
-        # Sort by price and return top N
         offers.sort(key=lambda o: float(o.get("dph_total", 999)))
         return [Offer.from_api(o) for o in offers[:top_n]]
 
