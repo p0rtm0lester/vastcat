@@ -78,10 +78,10 @@ def render_onstart_script(
     lines += [
         'echo "[vastcat] All assets ready — launching hashcat"',
         "",
-        f"{hashcat_command} -o {output_file} --status --status-timer=60",
+        hashcat_command,  # command already includes -o and --status flags
         "",
         'echo "[vastcat] Done at $(date)"',
-        f'echo "[vastcat] Cracked passwords:"',
+        'echo "[vastcat] Cracked passwords:"',
         f"cat {output_file} 2>/dev/null || echo '(none)'",
     ]
 
