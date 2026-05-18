@@ -20,6 +20,75 @@ class VastError(RuntimeError):
 HASHCAT_MIN_COMPUTE_CAP = 60   # stored as integer, e.g. 86 = compute 8.6
 HASHCAT_MIN_CUDA        = 11.0 # CUDA 11.0+ required for hashcat 6.x
 
+# Approximate hashcat MD5 throughput (GH/s) per card.
+# Used to rank offers by cracking efficiency (GH/s per dollar).
+# Sources: hashcat benchmark wiki + community benchmarks.
+GPU_SPEED_GHS: Dict[str, float] = {
+    # Blackwell
+    "RTX 5090":    300.0,
+    "RTX 5080":    200.0,
+    "RTX 5070 Ti": 155.0,
+    "RTX 5070":    130.0,
+    "RTX 5060 Ti":  80.0,
+    # Ada Lovelace
+    "RTX 4090":    164.0,
+    "RTX 4080 Super": 115.0,
+    "RTX 4080":    105.0,
+    "RTX 4070 Ti Super": 90.0,
+    "RTX 4070 Ti":  82.0,
+    "RTX 4070 Super": 74.0,
+    "RTX 4070S":    74.0,
+    "RTX 4070":     67.0,
+    "RTX 4060 Ti":  48.0,
+    "RTX 4060":     38.0,
+    # Ampere consumer
+    "RTX 3090 Ti": 110.0,
+    "RTX 3090":     98.0,
+    "RTX 3080 Ti":  87.0,
+    "RTX 3080":     82.0,
+    "RTX 3070 Ti":  72.0,
+    "RTX 3070":     67.0,
+    "RTX 3060 Ti":  55.0,
+    "RTX 3060":     44.0,
+    "RTX 3050":     30.0,
+    # Ampere datacenter
+    "A100":        180.0,
+    "A40":         108.0,
+    "A6000":       110.0,
+    "A5000":        95.0,
+    "A4000":        78.0,
+    "A30":          72.0,
+    "A10":          60.0,
+    "A16":          46.0,
+    # Hopper / Lovelace datacenter
+    "H100":        260.0,
+    "L40S":        135.0,
+    "L40":         120.0,
+    "L4":           45.0,
+    # Turing
+    "RTX 2080 Ti":  62.0,
+    "RTX 2080 Super": 55.0,
+    "RTX 2080":     49.0,
+    "RTX 2070 Super": 48.0,
+    "RTX 2070":     44.0,
+    "RTX 2060 Super": 40.0,
+    "RTX 2060":     36.0,
+    "T4":           28.0,
+    # Volta
+    "V100":         92.0,
+    "Titan V":      82.0,
+    # Pascal
+    "GTX 1080 Ti":  41.0,
+    "GTX 1080":     33.0,
+    "GTX 1070 Ti":  28.0,
+    "GTX 1070":     26.0,
+    "GTX 1060":     16.0,
+    "P100":         46.0,
+    # Titan
+    "Titan RTX":    68.0,
+    "Titan Xp":     36.0,
+}
+
 
 @dataclass
 class Offer:
@@ -55,13 +124,42 @@ class Offer:
             ssh_port=int(d.get("ssh_port", 22)),
         )
 
-    def display(self) -> str:
-        cc = f"{self.compute_cap / 10:.1f}" if self.compute_cap else "?"
-        return (
-            f"${self.hourly:.3f}/hr  {self.num_gpus}x {self.gpu_name} "
-            f"({self.vram_gb:.0f}GB VRAM)  CUDA {self.cuda_version}  "
-            f"compute {cc}  reliability={self.reliability:.2f}  id={self.id}"
-        )
+    def speed_ghs(self) -> float:
+        """Estimated MD5 hashcat speed in GH/s for this offer."""
+        base = 0.0
+        name = self.gpu_name
+        # Try longest match first (e.g. "RTX 4070 Ti Super" before "RTX 4070")
+        for key in sorted(GPU_SPEED_GHS, key=len, reverse=True):
+            if key.lower() in name.lower():
+                base = GPU_SPEED_GHS[key]
+                break
+        return base * self.num_gpus
+
+    def efficiency(self) -> float:
+        """GH/s per dollar — higher is better."""
+        if self.hourly <= 0:
+            return 0.0
+        return self.speed_ghs() / self.hourly
+
+    def display(self, rank: int = 0, best_efficiency: float = 0.0) -> str:
+        """Single-line display for use in a selection menu."""
+        speed = self.speed_ghs()
+        eff   = self.efficiency()
+        gpus  = f"{self.num_gpus}x " if self.num_gpus > 1 else ""
+        vram  = f"{self.vram_gb:.0f}GB"
+        price = f"${self.hourly:.3f}/hr"
+        spd   = f"~{speed:.0f} GH/s" if speed else "speed unknown"
+        rel   = f"{self.reliability * 100:.0f}% uptime"
+
+        # Value badge
+        if best_efficiency > 0 and eff >= best_efficiency * 0.95:
+            badge = "★ BEST  "
+        elif best_efficiency > 0 and eff >= best_efficiency * 0.80:
+            badge = "▲ GOOD  "
+        else:
+            badge = "        "
+
+        return f"{badge}{gpus}{self.gpu_name:<18} {vram:<5} CUDA {self.cuda_version:<4}  {price:<10} {spd:<16} {rel}"
 
 
 @dataclass
@@ -157,9 +255,16 @@ class VastClient:
             q["gpu_name"] = {"eq": gpu_name}
 
         data = self._get("/bundles/", {"q": json.dumps(q)})
-        offers = data.get("offers", [])
-        offers.sort(key=lambda o: float(o.get("dph_total", 999)))
-        return [Offer.from_api(o) for o in offers[:top_n]]
+        raw = data.get("offers", [])
+        offers = [Offer.from_api(o) for o in raw]
+
+        # Sort by efficiency (GH/s per dollar) descending.
+        # Unknown GPUs fall back to price-ascending so they appear at the end.
+        known   = sorted([o for o in offers if o.speed_ghs() > 0],
+                         key=lambda o: o.efficiency(), reverse=True)
+        unknown = sorted([o for o in offers if o.speed_ghs() == 0],
+                         key=lambda o: o.hourly)
+        return (known + unknown)[:top_n]
 
     def create_instance(
         self,

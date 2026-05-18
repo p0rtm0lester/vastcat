@@ -269,8 +269,10 @@ def vast_search(
     if not offers:
         console.print(cat_say("No offers found. Try raising --max-price or lowering --min-vram."))
         return
+    best_eff = max((o.efficiency() for o in offers), default=0.0)
+    console.print("[dim]  Badge   GPU                  VRAM  CUDA    Price      Est. speed       Uptime[/dim]")
     for o in offers:
-        console.print(o.display())
+        console.print(o.display(best_efficiency=best_eff))
 
 
 @app.command(name="install-hashcat")

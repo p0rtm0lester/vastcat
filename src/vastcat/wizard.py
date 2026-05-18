@@ -435,8 +435,11 @@ class Wizard:
             config['vast_deploy'] = False
             return "next"
 
-        offer_choices = [o.display() for o in offers]
+        best_eff = max((o.efficiency() for o in offers), default=0.0)
+        offer_choices = [o.display(best_efficiency=best_eff) for o in offers]
         offer_choices.append("← Cancel Vast.ai deployment")
+
+        self.console.print("\n[dim]  Badge   GPU                  VRAM  CUDA    Price      Est. speed       Uptime[/dim]")
         selected = questionary.select("Select a GPU instance", choices=offer_choices).ask()
 
         if selected == "← Cancel Vast.ai deployment":
