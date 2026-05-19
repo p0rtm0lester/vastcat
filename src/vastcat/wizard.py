@@ -799,7 +799,7 @@ class Wizard:
         notifier.notify("Vastcat", f"Instance {instance.id} starting on {offer.gpu_name}")
 
         try:
-            instance = client.wait_for_running(instance.id, timeout_s=300, poll_s=10)
+            instance = client.wait_for_running(instance.id, timeout_s=600, poll_s=10)
         except VastError as exc:
             self.console.print(f"[red]Instance failed to start:[/red] {exc}")
             return
