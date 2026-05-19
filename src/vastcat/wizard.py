@@ -662,12 +662,7 @@ class Wizard:
 
         wordlist_files = self._only_files(wordlist_paths, "wordlist")
         rule_files     = self._only_files(rule_paths, "rule")
-
-        # Remote paths used inside the Vast.ai instance
-        remote_hash      = "/root/hashes.txt"
-        remote_wordlists = [f"/root/wordlists/{Path(w).name}" for w in wordlist_files]
-        remote_rules     = [f"/root/rules/{Path(r).name}"     for r in rule_files]
-        remote_output    = config.get('output_file') or "/root/cracked.txt"
+        remote_output  = config.get('output_file') or "/root/cracked.txt"
 
         command_local = render_hashcat_command(
             hash_path=config['hash_path'],
@@ -680,23 +675,13 @@ class Wizard:
             mask=config.get('mask'),
         )
 
-        command_remote = render_hashcat_command(
-            hash_path=remote_hash,
-            hash_mode=config['hash_mode'],
-            attack_mode=config['attack_mode'],
-            wordlists=remote_wordlists,
-            rules=remote_rules,
-            output_file=remote_output,
-            workload=config.get('workload'),
-            mask=config.get('mask'),
-        )
-
         self.console.rule(cat_say("Hashcat Command"))
-        self.console.print(f"\n[bold]Command:[/bold]\n[italic]{command_local}[/italic]\n")
+        self.console.print(f"\n[bold]Command (local reference):[/bold]\n[italic]{command_local}[/italic]\n")
 
         # ── Vast.ai deployment ───────────────────────────────────────────────
         if config.get('vast_deploy') and config.get('vast_offer'):
-            self._deploy_to_vast(config, wordlist_files, rule_files, command_remote, remote_output, notifier)
+            # _deploy_to_vast builds the remote command itself from config keys
+            self._deploy_to_vast(config, wordlist_files, rule_files, "", remote_output, notifier)
             return
 
         # ── Local execution ──────────────────────────────────────────────────
@@ -733,18 +718,29 @@ class Wizard:
         config: dict,
         wordlist_files: List[str],
         rule_files: List[str],
-        remote_command: str,
+        _unused_remote_command: str,
         remote_output: str,
         notifier,
     ) -> None:
-        """Create a Vast.ai instance, SCP the hash file, then let the instance
-        download all wordlists/rules directly from source URLs."""
+        """Create a Vast.ai instance with a self-contained onstart script.
+
+        The hash file is embedded directly in the onstart script — no SCP,
+        no race condition, works from any machine regardless of SSH key setup.
+        Wordlists and rules are downloaded directly on the instance from source URLs.
+        """
         from .vast import VastClient, VastError
 
         offer  = config['vast_offer']
         client = VastClient(config['vast_api_key'])
 
-        # Build remote asset descriptors from the original source URLs
+        # Read hash file content to embed in onstart (avoids SCP race condition)
+        try:
+            hash_content = Path(config['hash_path']).read_text(errors='ignore').strip()
+        except OSError as exc:
+            self.console.print(f"[red]Cannot read hash file:[/red] {exc}")
+            return
+
+        # Build remote asset descriptors from original source URLs
         wordlist_assets = remote_assets_from_keys(
             config.get('wordlist_keys', []), "/root/wordlists"
         )
@@ -752,11 +748,10 @@ class Wizard:
             config.get('rule_keys', []), "/root/rules"
         )
 
-        # Remote paths for the hashcat command
         remote_wordlists = [f"/root/wordlists/{a.output_name}" for a in wordlist_assets]
         remote_rules     = [f"/root/rules/{a.output_name}"     for a in rule_assets]
 
-        remote_command = render_hashcat_command(
+        hashcat_command = render_hashcat_command(
             hash_path="/root/hashes.txt",
             hash_mode=config['hash_mode'],
             attack_mode=config['attack_mode'],
@@ -767,29 +762,27 @@ class Wizard:
             mask=config.get('mask'),
         )
 
-        # Notification curl command embedded in the onstart script (optional)
+        # Optional Pushover notification baked into the onstart script
         notif_cmd = None
         if config.get('pushover_token') and config.get('pushover_user'):
             notif_cmd = (
                 f'curl -s -F "token={config["pushover_token"]}" '
                 f'-F "user={config["pushover_user"]}" '
                 f'-F "title=Vastcat done" '
-                f'-F "message=Job finished on instance {{}}" '
+                f'-F "message=Job complete — results at {remote_output}" '
                 f'https://api.pushover.net/1/messages.json'
             )
 
-        # Generate self-contained onstart script
-        # Hash file is NOT embedded — it's uploaded via SCP after boot
         onstart = render_onstart_script(
-            hash_content="# uploaded via SCP — do not overwrite",
+            hash_content=hash_content,
             wordlist_assets=wordlist_assets,
             rule_assets=rule_assets,
-            hashcat_command=remote_command,
+            hashcat_command=hashcat_command,
             output_file=remote_output,
             notification_cmd=notif_cmd,
         )
 
-        self.console.print(cat_say(f"Creating instance on offer {offer.id} ({offer.gpu_name})..."))
+        self.console.print(cat_say(f"Creating instance — {offer.gpu_name} @ ${offer.hourly:.3f}/hr..."))
         try:
             instance = client.create_instance(
                 offer_id=offer.id,
@@ -803,7 +796,7 @@ class Wizard:
             return
 
         self.console.print(f"[green]✓[/green] Instance {instance.id} created — waiting for boot...")
-        notifier.notify("Vastcat", f"Instance {instance.id} created on {offer.gpu_name}")
+        notifier.notify("Vastcat", f"Instance {instance.id} starting on {offer.gpu_name}")
 
         try:
             instance = client.wait_for_running(instance.id, timeout_s=300, poll_s=10)
@@ -812,22 +805,9 @@ class Wizard:
             return
 
         self.console.print(f"[green]✓[/green] Running — {client.ssh_command(instance)}")
-
-        # SCP hash file (small — local only)
-        self.console.print("Uploading hash file...")
-        try:
-            client.upload_file(instance, config['hash_path'], "/root/hashes.txt")
-            self.console.print("[green]✓[/green] Hash file uploaded")
-        except VastError as exc:
-            self.console.print(f"[red]Hash upload failed:[/red] {exc}")
-            self.console.print("[dim]Instance will be destroyed to avoid billing.[/dim]")
-            client.destroy_instance(instance.id)
-            return
-
-        # Wordlists and rules download themselves via the onstart script
         self.console.print(cat_say(
-            f"Instance is downloading {len(wordlist_assets)} wordlist(s) and "
-            f"{len(rule_assets)} rule(s) directly — hashcat will start automatically."
+            f"Downloading {len(wordlist_assets)} wordlist(s) + "
+            f"{len(rule_assets)} rule(s) on instance — hashcat starts automatically."
         ))
 
         notifier.notify(
