@@ -415,14 +415,23 @@ class Wizard:
             config['vast_disk_gb']   = 20
         self.config.set("vast_disk_gb", config['vast_disk_gb'])
 
-        # Search offers
-        self.console.print(cat_say("Searching Vast.ai for matching GPUs..."))
+        # Search offers ranked by efficiency for the actual hash mode being cracked
+        hash_mode = config.get('hash_mode', '1000')
+        mode_name = {
+            "1000": "NTLM", "5600": "NetNTLMv2", "5500": "NetNTLMv1",
+            "300": "MySQL4.1", "0": "MD5", "100": "SHA-1",
+            "1400": "SHA-256", "3200": "bcrypt", "13100": "Kerberos TGS",
+            "18200": "Kerberos AS-REP", "22000": "WPA2",
+        }.get(str(hash_mode), f"mode {hash_mode}")
+
+        self.console.print(cat_say(f"Searching Vast.ai — ranking by efficiency for {mode_name}..."))
         try:
             from .vast import VastClient
             client = VastClient(api_key)
             offers = client.search_offers(
                 min_vram_gb=config['vast_min_vram'],
                 max_hourly=config['vast_max_price'],
+                hash_mode=str(hash_mode),
                 top_n=10,
             )
         except Exception as exc:
@@ -431,15 +440,15 @@ class Wizard:
             return "next"
 
         if not offers:
-            self.console.print(cat_say("No offers found matching your filters. Try raising max price or lowering VRAM."))
+            self.console.print(cat_say("No offers found. Try raising max price or lowering VRAM."))
             config['vast_deploy'] = False
             return "next"
 
-        best_eff = max((o.efficiency() for o in offers), default=0.0)
-        offer_choices = [o.display(best_efficiency=best_eff) for o in offers]
+        best_eff = max((o.efficiency(str(hash_mode)) for o in offers), default=0.0)
+        offer_choices = [o.display(best_efficiency=best_eff, hash_mode=str(hash_mode)) for o in offers]
         offer_choices.append("← Cancel Vast.ai deployment")
 
-        self.console.print("\n[dim]  Badge   GPU                  VRAM  CUDA    Price      Est. speed       Uptime[/dim]")
+        self.console.print(f"\n[dim]  Badge   GPU                  VRAM  CUDA    Price      Speed ({mode_name})        Uptime[/dim]")
         selected = questionary.select("Select a GPU instance", choices=offer_choices).ask()
 
         if selected == "← Cancel Vast.ai deployment":

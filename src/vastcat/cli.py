@@ -243,25 +243,31 @@ def vast_destroy(instance_id: int = typer.Argument(..., help="Instance ID to des
 
 @vast_app.command("search")
 def vast_search(
-    max_price:  float = typer.Option(0.50,  help="Max $/hr"),
-    min_vram:   float = typer.Option(8.0,   help="Min VRAM GB"),
-    gpu:        str   = typer.Option(None,  help="Filter by GPU name (e.g. 'RTX 4090')"),
+    max_price:  float = typer.Option(0.50,   help="Max $/hr"),
+    min_vram:   float = typer.Option(8.0,    help="Min VRAM GB"),
+    gpu:        str   = typer.Option(None,   help="Filter by GPU name (e.g. 'RTX 4090')"),
+    mode:       str   = typer.Option("1000", help="Hash mode to optimise for (e.g. 1000=NTLM, 5600=NetNTLMv2, 300=MySQL4.1)"),
     no_cuda_filter: bool = typer.Option(False, "--no-cuda-filter", help="Include non-CUDA instances"),
 ) -> None:
-    """Search for hashcat-compatible CUDA GPU offers on Vast.ai."""
+    """Search for hashcat-compatible CUDA GPU offers, ranked by efficiency for your hash type."""
     console = Console()
     config = ensure_config()
     api_key = config.get("vast_api_key") or os.environ.get("VAST_API_KEY", "")
     if not api_key:
         console.print("[red]No Vast.ai API key configured.[/red]")
         raise typer.Exit(1)
-    from .vast import VastClient, VastError, HASHCAT_MIN_COMPUTE_CAP, HASHCAT_MIN_CUDA
+    from .vast import VastClient, VastError, HASHCAT_MIN_COMPUTE_CAP, HASHCAT_MIN_CUDA, HASH_MODE_MULTIPLIER
+    mode_label = {
+        "1000": "NTLM", "5600": "NetNTLMv2", "5500": "NetNTLMv1",
+        "300": "MySQL4.1", "0": "MD5", "100": "SHA-1", "1400": "SHA-256",
+        "3200": "bcrypt", "13100": "Kerberos TGS", "18200": "Kerberos AS-REP", "22000": "WPA2",
+    }.get(mode, f"mode {mode}")
     if not no_cuda_filter:
-        console.print(f"[dim]Filtering: CUDA >= {HASHCAT_MIN_CUDA}, compute >= {HASHCAT_MIN_COMPUTE_CAP/10:.1f} (Pascal+)[/dim]")
+        console.print(f"[dim]CUDA >= {HASHCAT_MIN_CUDA}, compute >= {HASHCAT_MIN_COMPUTE_CAP/10:.1f} | ranked by {mode_label} efficiency[/dim]")
     try:
         offers = VastClient(api_key).search_offers(
             min_vram_gb=min_vram, max_hourly=max_price,
-            gpu_name=gpu, cuda_only=not no_cuda_filter,
+            gpu_name=gpu, cuda_only=not no_cuda_filter, hash_mode=mode,
         )
     except VastError as exc:
         console.print(f"[red]{exc}[/red]")
@@ -269,10 +275,10 @@ def vast_search(
     if not offers:
         console.print(cat_say("No offers found. Try raising --max-price or lowering --min-vram."))
         return
-    best_eff = max((o.efficiency() for o in offers), default=0.0)
-    console.print("[dim]  Badge   GPU                  VRAM  CUDA    Price      Est. speed       Uptime[/dim]")
+    best_eff = max((o.efficiency(mode) for o in offers), default=0.0)
+    console.print(f"[dim]  Badge   GPU                  VRAM  CUDA    Price      Speed ({mode_label})        Uptime[/dim]")
     for o in offers:
-        console.print(o.display(best_efficiency=best_eff))
+        console.print(o.display(best_efficiency=best_eff, hash_mode=mode))
 
 
 @app.command(name="install-hashcat")
