@@ -42,16 +42,18 @@ def render_onstart_script(
         "apt-get update -qq",
         "apt-get install -y -qq wget curl p7zip-full unzip build-essential git",
         "",
-        "# Ensure hashcat is available",
+        "# Ensure hashcat is available — use pre-built binary, no compilation needed",
         "if ! command -v hashcat &>/dev/null; then",
-        "  echo '[vastcat] hashcat not found — installing from source'",
+        "  echo '[vastcat] Installing hashcat pre-built binary...'",
         "  cd /tmp",
         "  wget -q https://hashcat.net/files/hashcat-7.1.2.tar.gz -O hashcat.tar.gz",
         "  tar -xzf hashcat.tar.gz",
-        "  cd hashcat-7.1.2",
-        "  make -j$(nproc)",
-        "  make install PREFIX=/usr/local",
+        "  cp hashcat-7.1.2/hashcat /usr/local/bin/hashcat",
+        "  chmod +x /usr/local/bin/hashcat",
+        "  mkdir -p /usr/local/share/hashcat",
+        "  cp -r hashcat-7.1.2/OpenCL /usr/local/share/hashcat/",
         "  cd /",
+        "  echo '[vastcat] hashcat ready'",
         "fi",
         "",
         "mkdir -p /root/wordlists /root/rules",
@@ -63,18 +65,33 @@ def render_onstart_script(
         "",
     ]
 
-    # Wordlist downloads
+    # Download wordlists in parallel
     if wordlist_assets:
-        lines.append("# Download wordlists")
+        lines.append("# Download wordlists in parallel")
+        lines.append("(")
         for asset in wordlist_assets:
-            lines.extend(_download_block(asset))
+            block = _download_block(asset)
+            # Wrap each asset's download block in a subshell backgrounded
+            lines.append("  (")
+            for bl in block:
+                lines.append(f"  {bl}")
+            lines.append("  ) &")
+        lines.append("  wait")
+        lines.append(")")
         lines.append("")
 
-    # Rule downloads
+    # Download rules in parallel
     if rule_assets:
-        lines.append("# Download rules")
+        lines.append("# Download rules in parallel")
+        lines.append("(")
         for asset in rule_assets:
-            lines.extend(_download_block(asset))
+            block = _download_block(asset)
+            lines.append("  (")
+            for bl in block:
+                lines.append(f"  {bl}")
+            lines.append("  ) &")
+        lines.append("  wait")
+        lines.append(")")
         lines.append("")
 
     lines += [

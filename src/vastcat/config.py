@@ -17,7 +17,7 @@ DEFAULTS: Dict[str, Any] = {
     "pushover_token": None,
     "pushover_user": None,
     "vast_api_key": os.environ.get("VAST_API_KEY", ""),
-    "vast_image": "dizcza/docker-hashcat:latest",
+    "vast_image": "nvidia/cuda:12.2.0-devel-ubuntu22.04",
     "vast_disk_gb": 20,
     "auto_download_assets": True,
     "asset_manifest": "~/.config/vastcat/assets.yaml",

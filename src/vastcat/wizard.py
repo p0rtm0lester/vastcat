@@ -352,9 +352,9 @@ class Wizard:
 
     # Known Docker images that have hashcat pre-installed
     HASHCAT_IMAGES = [
-        "dizcza/docker-hashcat:latest",
-        "dizcza/docker-hashcat:cuda11.7",
-        "nvidia/cuda:12.2.0-runtime-ubuntu22.04",  # base, hashcat not included
+        "nvidia/cuda:12.2.0-devel-ubuntu22.04",    # recommended — pre-built binary, reliable
+        "nvidia/cuda:12.4.0-devel-ubuntu22.04",
+        "dizcza/docker-hashcat:cuda",               # hashcat pre-installed, but can OOM on large rule sets
     ]
 
     def _step_vast_deploy(self, config: dict, can_go_back: bool) -> str:
